@@ -3,6 +3,10 @@
 #include <string.h>
 #include <stdio.h>
 
+#define LEAF_NODE_MIN_CELLS (LEAF_NODE_MAX_CELLS / 2)
+#define INTERNAL_NODE_MIN_KEYS (INTERNAL_NODE_MAX_KEYS / 2)
+
+
 static void die(const char *msg) {
     perror(msg);
     exit(1);
@@ -112,6 +116,10 @@ static uint32_t *internal_node_key(void *node, uint32_t cell_num) {
     return (uint32_t *)((uint8_t *)internal_node_cell(node, cell_num) + INTERNAL_NODE_CHILD_SIZE);
 }
 
+/* Forward declarations for rebalancing */
+static void internal_node_update_key_for_child(Table *t, uint32_t parent_page, uint32_t child_page);
+static void internal_node_remove_child(Table *t, uint32_t parent_page, uint32_t child_page);
+
 static void print_indent(uint32_t level) {
     for (uint32_t i = 0; i < level; i++) printf("  ");
 }
@@ -149,6 +157,169 @@ void btree_print(Table *t) {
     printf("B-Tree structure:\n");
     print_node(t, t->header.root_page_num, 0);
 }
+
+// Helpers
+static bool find_leaf_siblings(
+    Table *t,
+    uint32_t leaf_page,
+    uint32_t *left_page,
+    uint32_t *right_page,
+    uint32_t *parent_page
+) {
+    void *leaf = pager_get_page(t->pager, leaf_page);
+    if (is_node_root(leaf)) return false;
+
+    *parent_page = *node_parent(leaf);
+    void *parent = pager_get_page(t->pager, *parent_page);
+
+    uint32_t num_keys = *internal_node_num_keys(parent);
+
+    for (uint32_t i = 0; i <= num_keys; i++) {
+        uint32_t child =
+            (i == num_keys)
+                ? *internal_node_right_child(parent)
+                : *internal_node_child(parent, i);
+
+        if (child == leaf_page) {
+            *left_page  = (i > 0) ? *internal_node_child(parent, i - 1) : 0;
+            *right_page = (i < num_keys) ? *internal_node_child(parent, i + 1)
+                                         : *internal_node_right_child(parent);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool try_borrow_from_left(
+    Table *t,
+    uint32_t leaf_page,
+    uint32_t left_page,
+    uint32_t parent_page
+) {
+    if (!left_page) return false;
+
+    void *leaf = pager_get_page(t->pager, leaf_page);
+    void *left = pager_get_page(t->pager, left_page);
+
+    if (*leaf_node_num_cells(left) <= LEAF_NODE_MIN_CELLS)
+        return false;
+
+    // shift leaf right
+    memmove(
+        leaf_node_cell(leaf, 1),
+        leaf_node_cell(leaf, 0),
+        (*leaf_node_num_cells(leaf)) * LEAF_NODE_CELL_SIZE
+    );
+
+    // copy last cell from left
+    uint32_t borrow_idx = *leaf_node_num_cells(left) - 1;
+    memcpy(
+        leaf_node_cell(leaf, 0),
+        leaf_node_cell(left, borrow_idx),
+        LEAF_NODE_CELL_SIZE
+    );
+
+    (*leaf_node_num_cells(left))--;
+    (*leaf_node_num_cells(leaf))++;
+
+    internal_node_update_key_for_child(t, parent_page, left_page);
+    return true;
+}
+
+
+static bool try_borrow_from_right(
+    Table *t,
+    uint32_t leaf_page,
+    uint32_t right_page,
+    uint32_t parent_page
+) {
+    if (!right_page) return false;
+
+    void *leaf = pager_get_page(t->pager, leaf_page);
+    void *right = pager_get_page(t->pager, right_page);
+
+    if (*leaf_node_num_cells(right) <= LEAF_NODE_MIN_CELLS)
+        return false;
+
+    // copy first cell of right
+    memcpy(
+        leaf_node_cell(leaf, *leaf_node_num_cells(leaf)),
+        leaf_node_cell(right, 0),
+        LEAF_NODE_CELL_SIZE
+    );
+
+    // shift right left
+    memmove(
+        leaf_node_cell(right, 0),
+        leaf_node_cell(right, 1),
+        (*leaf_node_num_cells(right) - 1) * LEAF_NODE_CELL_SIZE
+    );
+
+    (*leaf_node_num_cells(right))--;
+    (*leaf_node_num_cells(leaf))++;
+
+    internal_node_update_key_for_child(t, parent_page, leaf_page);
+    return true;
+}
+
+static void merge_leaf_nodes(
+    Table *t,
+    uint32_t left_page,
+    uint32_t right_page,
+    uint32_t parent_page
+) {
+    void *left = pager_get_page(t->pager, left_page);
+    void *right = pager_get_page(t->pager, right_page);
+
+    uint32_t left_n = *leaf_node_num_cells(left);
+    uint32_t right_n = *leaf_node_num_cells(right);
+
+    memcpy(
+        leaf_node_cell(left, left_n),
+        leaf_node_cell(right, 0),
+        right_n * LEAF_NODE_CELL_SIZE
+    );
+
+    *leaf_node_num_cells(left) = left_n + right_n;
+    *leaf_node_next_leaf(left) = *leaf_node_next_leaf(right);
+
+    // remove right_page from parent
+    internal_node_remove_child(t, parent_page, right_page);
+}
+
+static void maybe_shrink_root(Table *t) {
+    void *root = pager_get_page(t->pager, t->header.root_page_num);
+
+    if (get_node_type(root) == NODE_INTERNAL &&
+        *internal_node_num_keys(root) == 0) {
+
+        uint32_t new_root =
+            *internal_node_right_child(root);
+
+        void *child = pager_get_page(t->pager, new_root);
+        set_node_root(child, true);
+        *node_parent(child) = 0;
+
+        t->header.root_page_num = new_root;
+    }
+}
+
+static void rebalance_leaf(Table *t, uint32_t leaf_page) {
+    uint32_t left = 0, right = 0, parent = 0;
+
+    if (!find_leaf_siblings(t, leaf_page, &left, &right, &parent))
+        return;
+
+    if (try_borrow_from_left(t, leaf_page, left, parent)) return;
+    if (try_borrow_from_right(t, leaf_page, right, parent)) return;
+
+    // merge
+    if (left) merge_leaf_nodes(t, left, leaf_page, parent);
+    else if (right) merge_leaf_nodes(t, leaf_page, right, parent);
+
+    maybe_shrink_root(t);
+}
+
 
 
 /* ============================================================
@@ -409,6 +580,37 @@ static void internal_node_update_key_for_child(Table *t, uint32_t parent_page, u
         }
     }
     // if it's right_child => no stored key
+}
+
+/* Remove a child from internal node */
+static void internal_node_remove_child(Table *t, uint32_t parent_page, uint32_t child_page) {
+    void *parent = pager_get_page(t->pager, parent_page);
+    uint32_t num_keys = *internal_node_num_keys(parent);
+
+    // Collect all children except the one to remove
+    uint32_t children[INTERNAL_NODE_MAX_CHILDREN];
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < num_keys; i++) {
+        uint32_t child = *internal_node_child(parent, i);
+        if (child != child_page) {
+            children[count++] = child;
+        }
+    }
+
+    uint32_t right = *internal_node_right_child(parent);
+    if (right != child_page) {
+        children[count++] = right;
+    }
+
+    // Rebuild with remaining children
+    if (count >= 2) {
+        internal_node_rebuild(t, parent_page, children, count);
+    } else if (count == 1) {
+        // Only one child left - this will be handled by maybe_shrink_root
+        *internal_node_num_keys(parent) = 0;
+        *internal_node_right_child(parent) = children[0];
+    }
 }
 
 /* ============================================================
@@ -681,6 +883,11 @@ bool btree_delete(Table *t, int32_t key, char *errbuf, uint32_t errbuf_sz) {
      * If leaf becomes underfull, we DO NOTHING in Commit 11.
      * This is intentional groundwork for Commit 12 (merge/redistribute).
      */
+    uint32_t min_cells = is_node_root(leaf) ? 1 : LEAF_NODE_MIN_CELLS;
+
+    if (*leaf_node_num_cells(leaf) < min_cells) {
+        rebalance_leaf(t, c->page_num);
+    }
 
     btree_cursor_free(c);
     return true;

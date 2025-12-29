@@ -1,6 +1,6 @@
 // Commit 10: Full recursive B-Tree (internal splits + root split)
 // Commit 11: Delete ground work + tree introspection 
-
+// Commit 12: Delete with Rebalancing (borrow + merge)
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
