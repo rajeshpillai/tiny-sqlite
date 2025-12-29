@@ -1,20 +1,17 @@
-CC := gcc
-CLFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O0 -g 
-LDFLAGS :=
+CC=gcc
+CFLAGS=-std=c11 -Wall -Wextra -Wpedantic -O0 -g
 
-BIN := tinydb 
-SRC := src/main.c 
-INC := -Iinclude 
+INCLUDES=-Isrc/include
+SRC=src/main.c src/pager.c src/btree.c src/db.c
+OUT=tinydb
 
-.PHONY: all run clean 
+all: $(OUT)
 
-all: $(BIN) 
+$(OUT): $(SRC)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(OUT) $(SRC)
 
-$(BIN): $(SRC)
-	$(CC) $(CLFLAGS) $(INC) -o $@ $^ $(LDFLAGS) 
-
-run: $(BIN)
-	./$(BIN)
+run: all
+	./$(OUT)
 
 clean:
-	rm -f $(BIN)
+	rm -f $(OUT) test.db
