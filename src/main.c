@@ -1,4 +1,5 @@
 // Commit 10: Full recursive B-Tree (internal splits + root split)
+// Commit 11: Delete ground work + tree introspection 
 
 #include <stdio.h>
 #include <string.h>
@@ -12,7 +13,8 @@
 
 typedef enum {
     STMT_INSERT,
-    STMT_SELECT
+    STMT_SELECT,
+    STMT_DELETE
 } StatementType;
 
 typedef struct {
@@ -39,12 +41,28 @@ static bool prepare_insert(const char *input, Statement *st) {
                   &st->row.id, st->row.username, st->row.email) == 3;
 }
 
+static bool prepare_delete(const char *input, Statement *st) {
+    st->type = STMT_DELETE;
+    return sscanf(input, "delete %d", &st->row.id) == 1;
+}
+
 static bool prepare_statement(const char *input, Statement *st) {
     if (starts_with_icase_n(input, "insert", 6)) return prepare_insert(input, st);
     if (starts_with_icase_n(input, "select", 6)) { st->type = STMT_SELECT; return true; }
+    if (starts_with_icase_n(input, "delete", 6)) return prepare_delete(input, st);
     puts("Unrecognized statement");
     return false;
 }
+
+static void execute_delete(Table *t, int32_t key) {
+    char err[128] = {0};
+    if (!btree_delete(t, key, err, sizeof(err))) {
+        printf("Error: %s\n", err);
+        return;
+    }
+    puts("Deleted.");
+}
+
 
 static void execute_select(Table *t) {
     Cursor *c = btree_table_start(t);
@@ -79,15 +97,22 @@ int main(void) {
 
         if (input[0] == '.') {
             if (strcmp(input, ".exit") == 0) break;
+            if (strcmp(input, ".btree") == 0) {
+                btree_print(t);
+                continue;
+            }
+
             puts("Unrecognized meta command");
             continue;
         }
+        
 
         Statement st;
         if (!prepare_statement(input, &st)) continue;
 
         if (st.type == STMT_INSERT) execute_insert(t, &st.row);
-        else execute_select(t);
+        else if (st.type == STMT_SELECT) execute_select(t); 
+        else execute_delete(t, st.row.id);
     }
 
     db_close(t);

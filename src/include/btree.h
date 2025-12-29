@@ -49,8 +49,12 @@ void    btree_cursor_advance(Cursor *c);
 void   *btree_cursor_value(Cursor *c);
 void    btree_cursor_free(Cursor *c);
 
-/* Find/Insert */
+/* Find/Insert/Delete */
 Cursor *btree_table_find(Table *t, int32_t key);
 bool    btree_insert(Table *t, const Row *row, char *errbuf, uint32_t errbuf_sz);
+bool    btree_delete(Table *t, int32_t key, char *errbuf, uint32_t errbuf_sz);
+
+/* Debug/Introspection */
+void    btree_print(Table *t);
 
 #endif

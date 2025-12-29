@@ -112,6 +112,45 @@ static uint32_t *internal_node_key(void *node, uint32_t cell_num) {
     return (uint32_t *)((uint8_t *)internal_node_cell(node, cell_num) + INTERNAL_NODE_CHILD_SIZE);
 }
 
+static void print_indent(uint32_t level) {
+    for (uint32_t i = 0; i < level; i++) printf("  ");
+}
+
+static void print_node(Table *t, uint32_t page, uint32_t level) {
+    void *node = pager_get_page(t->pager, page);
+
+    print_indent(level);
+
+    if (get_node_type(node) == NODE_LEAF) {
+        uint32_t n = *leaf_node_num_cells(node);
+        printf("- leaf (page %u, cells %u): ", page, n);
+        for (uint32_t i = 0; i < n; i++) {
+            printf("%u ", *leaf_node_key(node, i));
+        }
+        printf("\n");
+        return;
+    }
+
+    uint32_t keys = *internal_node_num_keys(node);
+    printf("- internal (page %u, keys %u)\n", page, keys);
+
+    for (uint32_t i = 0; i < keys; i++) {
+        uint32_t child = *internal_node_child(node, i);
+        print_node(t, child, level + 1);
+        print_indent(level + 1);
+        printf("key <= %u\n", *internal_node_key(node, i));
+    }
+
+    uint32_t right = *internal_node_right_child(node);
+    print_node(t, right, level + 1);
+}
+
+void btree_print(Table *t) {
+    printf("B-Tree structure:\n");
+    print_node(t, t->header.root_page_num, 0);
+}
+
+
 /* ============================================================
  * Init
  * ============================================================ */
@@ -611,6 +650,42 @@ bool btree_insert(Table *t, const Row *row, char *errbuf, uint32_t errbuf_sz) {
     btree_cursor_free(c);
     return true;
 }
+
+bool btree_delete(Table *t, int32_t key, char *errbuf, uint32_t errbuf_sz) {
+    Cursor *c = btree_table_find(t, key);
+    void *leaf = pager_get_page(t->pager, c->page_num);
+    uint32_t n = *leaf_node_num_cells(leaf);
+
+    if (c->cell_num >= n ||
+        (int32_t)(*leaf_node_key(leaf, c->cell_num)) != key) {
+        if (errbuf && errbuf_sz)
+            snprintf(errbuf, errbuf_sz, "key not found");
+        btree_cursor_free(c);
+        return false;
+    }
+
+    /* Shift cells left */
+    for (uint32_t i = c->cell_num + 1; i < n; i++) {
+        memmove(
+            leaf_node_cell(leaf, i - 1),
+            leaf_node_cell(leaf, i),
+            LEAF_NODE_CELL_SIZE
+        );
+    }
+
+    *leaf_node_num_cells(leaf) = n - 1;
+    t->header.num_rows--;
+
+    /*
+     * IMPORTANT:
+     * If leaf becomes underfull, we DO NOTHING in Commit 11.
+     * This is intentional groundwork for Commit 12 (merge/redistribute).
+     */
+
+    btree_cursor_free(c);
+    return true;
+}
+
 
 /* ============================================================
  * New DB init
