@@ -119,6 +119,8 @@ static uint32_t *internal_node_key(void *node, uint32_t cell_num) {
 /* Forward declarations for rebalancing */
 static void internal_node_update_key_for_child(Table *t, uint32_t parent_page, uint32_t child_page);
 static void internal_node_remove_child(Table *t, uint32_t parent_page, uint32_t child_page);
+static void internal_node_rebuild(Table *t, uint32_t internal_page, uint32_t *children, uint32_t count);
+
 
 static void print_indent(uint32_t level) {
     for (uint32_t i = 0; i < level; i++) printf("  ");
@@ -182,8 +184,14 @@ static bool find_leaf_siblings(
 
         if (child == leaf_page) {
             *left_page  = (i > 0) ? *internal_node_child(parent, i - 1) : 0;
-            *right_page = (i < num_keys) ? *internal_node_child(parent, i + 1)
-                                         : *internal_node_right_child(parent);
+            // Right sibling: if we're the rightmost child, there's no right sibling
+            if (i == num_keys) {
+                *right_page = 0;
+            } else {
+                *right_page = (i + 1 < num_keys) 
+                    ? *internal_node_child(parent, i + 1)
+                    : *internal_node_right_child(parent);
+            }
             return true;
         }
     }
@@ -320,6 +328,216 @@ static void rebalance_leaf(Table *t, uint32_t leaf_page) {
     maybe_shrink_root(t);
 }
 
+/* ============================================================
+ * Internal Node Rebalancing
+ * ============================================================ */
+
+static bool find_internal_siblings(
+    Table *t,
+    uint32_t internal_page,
+    uint32_t *left_page,
+    uint32_t *right_page,
+    uint32_t *parent_page
+) {
+    void *internal = pager_get_page(t->pager, internal_page);
+    if (is_node_root(internal)) return false;
+
+    *parent_page = *node_parent(internal);
+    void *parent = pager_get_page(t->pager, *parent_page);
+
+    uint32_t num_keys = *internal_node_num_keys(parent);
+
+    for (uint32_t i = 0; i <= num_keys; i++) {
+        uint32_t child =
+            (i == num_keys)
+                ? *internal_node_right_child(parent)
+                : *internal_node_child(parent, i);
+
+        if (child == internal_page) {
+            *left_page  = (i > 0) ? *internal_node_child(parent, i - 1) : 0;
+            // Right sibling: if we're the rightmost child, there's no right sibling
+            if (i == num_keys) {
+                *right_page = 0;
+            } else {
+                *right_page = (i + 1 < num_keys) 
+                    ? *internal_node_child(parent, i + 1)
+                    : *internal_node_right_child(parent);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool try_borrow_from_left_internal(
+    Table *t,
+    uint32_t internal_page,
+    uint32_t left_page,
+    uint32_t parent_page
+) {
+    if (!left_page) return false;
+
+    void *internal = pager_get_page(t->pager, internal_page);
+    void *left = pager_get_page(t->pager, left_page);
+    
+    // Ensure both nodes are internal nodes
+    if (get_node_type(left) != NODE_INTERNAL) return false;
+    if (get_node_type(internal) != NODE_INTERNAL) return false;
+
+    if (*internal_node_num_keys(left) <= INTERNAL_NODE_MIN_KEYS)
+        return false;
+
+    // Collect all children from left sibling
+    uint32_t left_num_keys = *internal_node_num_keys(left);
+    uint32_t left_children[INTERNAL_NODE_MAX_CHILDREN];
+    uint32_t left_count = 0;
+
+    for (uint32_t i = 0; i < left_num_keys; i++) {
+        left_children[left_count++] = *internal_node_child(left, i);
+    }
+    left_children[left_count++] = *internal_node_right_child(left);
+
+    // Take the last child from left
+    uint32_t borrowed_child = left_children[--left_count];
+
+    // Rebuild left with remaining children
+    internal_node_rebuild(t, left_page, left_children, left_count);
+
+    // Collect all children from current node
+    uint32_t curr_num_keys = *internal_node_num_keys(internal);
+    uint32_t curr_children[INTERNAL_NODE_MAX_CHILDREN];
+    uint32_t curr_count = 0;
+
+    for (uint32_t i = 0; i < curr_num_keys; i++) {
+        curr_children[curr_count++] = *internal_node_child(internal, i);
+    }
+    curr_children[curr_count++] = *internal_node_right_child(internal);
+
+    // Insert borrowed child at the beginning
+    memmove(&curr_children[1], &curr_children[0], curr_count * sizeof(uint32_t));
+    curr_children[0] = borrowed_child;
+    curr_count++;
+
+    // Rebuild current node
+    internal_node_rebuild(t, internal_page, curr_children, curr_count);
+
+    // Update parent keys
+    internal_node_update_key_for_child(t, parent_page, left_page);
+    internal_node_update_key_for_child(t, parent_page, internal_page);
+
+    return true;
+}
+
+static bool try_borrow_from_right_internal(
+    Table *t,
+    uint32_t internal_page,
+    uint32_t right_page,
+    uint32_t parent_page
+) {
+    if (!right_page) return false;
+
+    void *internal = pager_get_page(t->pager, internal_page);
+    void *right = pager_get_page(t->pager, right_page);
+    
+    // Ensure both nodes are internal nodes
+    if (get_node_type(right) != NODE_INTERNAL) return false;
+    if (get_node_type(internal) != NODE_INTERNAL) return false;
+
+    if (*internal_node_num_keys(right) <= INTERNAL_NODE_MIN_KEYS)
+        return false;
+
+    // Collect all children from right sibling
+    uint32_t right_num_keys = *internal_node_num_keys(right);
+    uint32_t right_children[INTERNAL_NODE_MAX_CHILDREN];
+    uint32_t right_count = 0;
+
+    for (uint32_t i = 0; i < right_num_keys; i++) {
+        right_children[right_count++] = *internal_node_child(right, i);
+    }
+    right_children[right_count++] = *internal_node_right_child(right);
+
+    // Take the first child from right
+    uint32_t borrowed_child = right_children[0];
+    memmove(&right_children[0], &right_children[1], (right_count - 1) * sizeof(uint32_t));
+    right_count--;
+
+    // Rebuild right with remaining children
+    internal_node_rebuild(t, right_page, right_children, right_count);
+
+    // Collect all children from current node
+    uint32_t curr_num_keys = *internal_node_num_keys(internal);
+    uint32_t curr_children[INTERNAL_NODE_MAX_CHILDREN];
+    uint32_t curr_count = 0;
+
+    for (uint32_t i = 0; i < curr_num_keys; i++) {
+        curr_children[curr_count++] = *internal_node_child(internal, i);
+    }
+    curr_children[curr_count++] = *internal_node_right_child(internal);
+
+    // Append borrowed child
+    curr_children[curr_count++] = borrowed_child;
+
+    // Rebuild current node
+    internal_node_rebuild(t, internal_page, curr_children, curr_count);
+
+    // Update parent keys
+    internal_node_update_key_for_child(t, parent_page, internal_page);
+    internal_node_update_key_for_child(t, parent_page, right_page);
+
+    return true;
+}
+
+static void merge_internal_nodes(
+    Table *t,
+    uint32_t left_page,
+    uint32_t right_page,
+    uint32_t parent_page
+) {
+    void *left = pager_get_page(t->pager, left_page);
+    void *right = pager_get_page(t->pager, right_page);
+    
+    // Ensure both nodes are internal nodes
+    if (get_node_type(left) != NODE_INTERNAL) return;
+    if (get_node_type(right) != NODE_INTERNAL) return;
+
+    // Collect all children from both nodes
+    uint32_t all_children[INTERNAL_NODE_MAX_CHILDREN * 2];
+    uint32_t count = 0;
+
+    uint32_t left_num_keys = *internal_node_num_keys(left);
+    for (uint32_t i = 0; i < left_num_keys; i++) {
+        all_children[count++] = *internal_node_child(left, i);
+    }
+    all_children[count++] = *internal_node_right_child(left);
+
+    uint32_t right_num_keys = *internal_node_num_keys(right);
+    for (uint32_t i = 0; i < right_num_keys; i++) {
+        all_children[count++] = *internal_node_child(right, i);
+    }
+    all_children[count++] = *internal_node_right_child(right);
+
+    // Rebuild left with all children
+    internal_node_rebuild(t, left_page, all_children, count);
+
+    // Remove right from parent (this may trigger recursive rebalancing)
+    internal_node_remove_child(t, parent_page, right_page);
+}
+
+static void rebalance_internal(Table *t, uint32_t internal_page) {
+    uint32_t left = 0, right = 0, parent = 0;
+
+    if (!find_internal_siblings(t, internal_page, &left, &right, &parent))
+        return;
+
+    if (try_borrow_from_left_internal(t, internal_page, left, parent)) return;
+    if (try_borrow_from_right_internal(t, internal_page, right, parent)) return;
+
+    // merge
+    if (left) merge_internal_nodes(t, left, internal_page, parent);
+    else if (right) merge_internal_nodes(t, internal_page, right, parent);
+
+    maybe_shrink_root(t);
+}
 
 
 /* ============================================================
@@ -610,6 +828,12 @@ static void internal_node_remove_child(Table *t, uint32_t parent_page, uint32_t 
         // Only one child left - this will be handled by maybe_shrink_root
         *internal_node_num_keys(parent) = 0;
         *internal_node_right_child(parent) = children[0];
+    }
+
+    // Check if parent became underfull and needs rebalancing
+    uint32_t min_keys = is_node_root(parent) ? 0 : INTERNAL_NODE_MIN_KEYS;
+    if (*internal_node_num_keys(parent) < min_keys) {
+        rebalance_internal(t, parent_page);
     }
 }
 
