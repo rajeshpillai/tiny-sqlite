@@ -1,8 +1,98 @@
+/*
+ * ============================================================================
+ * B-TREE IMPLEMENTATION FOR TINYDB
+ * ============================================================================
+ * 
+ * This file implements a B+tree data structure for storing rows on disk.
+ * 
+ * OVERVIEW:
+ * ---------
+ * - Internal nodes: Store keys and child page pointers (no actual data)
+ * - Leaf nodes: Store keys and actual row data, linked together for scans
+ * - All data resides in leaf nodes; internal nodes only guide searches
+ * - Tree grows/shrinks automatically via splitting and rebalancing
+ * 
+ * B-TREE STRUCTURE EXAMPLE:
+ * -------------------------
+ * 
+ *     [Internal: 50]              Root (page 1)
+ *         /    \
+ *        /      \
+ *   [Leaf: 10,20,30]  →  [Leaf: 60,70,80]    (pages 2,3)
+ * 
+ * - Internal node contains key "50" separating two children
+ * - Left child: all keys ≤ 50
+ * - Right child: all keys > 50  
+ * - Leaves are linked (→) for efficient range scans
+ * 
+ * NODE LAYOUT IN MEMORY (4KB pages):
+ * -----------------------------------
+ * 
+ * LEAF NODE:
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ Common Header (6 bytes)                                     │
+ * │  - node_type: 1 byte (0=internal, 1=leaf)                  │
+ * │  - is_root: 1 byte (0=no, 1=yes)                           │
+ * │  - parent: 4 bytes (page number of parent)                 │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ Leaf Header (8 bytes)                                       │
+ * │  - num_cells: 4 bytes (how many key-value pairs)           │
+ * │  - next_leaf: 4 bytes (page number of next leaf, 0 if none)│
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ Cell 0: [key: 4 bytes][row: 291 bytes]                     │
+ * │ Cell 1: [key: 4 bytes][row: 291 bytes]                     │
+ * │ ...                                                         │
+ * │ Cell N: [key: 4 bytes][row: 291 bytes]                     │
+ * └─────────────────────────────────────────────────────────────┘
+ * 
+ * INTERNAL NODE:
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ Common Header (6 bytes)                                     │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ Internal Header (8 bytes)                                   │
+ * │  - num_keys: 4 bytes (number of child pointers - 1)        │
+ * │  - right_child: 4 bytes (page number of rightmost child)   │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ Cell 0: [child_ptr: 4 bytes][max_key: 4 bytes]            │
+ * │ Cell 1: [child_ptr: 4 bytes][max_key: 4 bytes]            │
+ * │ ...                                                         │
+ * │ Cell N: [child_ptr: 4 bytes][max_key: 4 bytes]            │
+ * │ Right Child: stored in header, no key needed               │
+ * └─────────────────────────────────────────────────────────────┘
+ * 
+ * KEY INVARIANTS:
+ * ---------------
+ * 1. All keys in a node are sorted in ascending order
+ * 2. Leaf nodes: MIN_CELLS ≤ cells ≤ MAX_CELLS (except root)
+ * 3. Internal nodes: MIN_KEYS ≤ num_keys ≤ MAX_KEYS (except root)
+ * 4. Root can have as few as 1 cell (leaf) or 0 keys (internal with 1 child)
+ * 5. All leaves are at the same depth (balanced tree)
+ * 
+ * OPERATIONS:
+ * -----------
+ * - INSERT: Find leaf, insert sorted, split if overflow, propagate up
+ * - DELETE: Find leaf, remove key, rebalance if underflow (borrow/merge)
+ * - SEARCH: Descend from root following key comparisons
+ * - SCAN: Start at leftmost leaf, follow next_leaf pointers
+ * 
+ * REBALANCING STRATEGY:
+ * ---------------------
+ * When a node becomes underfull after deletion:
+ * 1. Try to borrow from left sibling (if it has extra cells/keys)
+ * 2. Try to borrow from right sibling (if it has extra cells/keys)
+ * 3. Merge with a sibling (combine into one node)
+ * 4. Recursively rebalance parent if it becomes underfull
+ * 5. Shrink tree height if root becomes empty
+ * 
+ * ============================================================================
+ */
+
 #include "btree.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
+/* Minimum thresholds for rebalancing */
 #define LEAF_NODE_MIN_CELLS (LEAF_NODE_MAX_CELLS / 2)
 #define INTERNAL_NODE_MIN_KEYS (INTERNAL_NODE_MAX_KEYS / 2)
 
@@ -160,7 +250,36 @@ void btree_print(Table *t) {
     print_node(t, t->header.root_page_num, 0);
 }
 
-// Helpers
+/* ============================================================
+ * LEAF NODE REBALANCING
+ * ============================================================ */
+
+/*
+ * find_leaf_siblings - Locate left and right siblings of a leaf node
+ * 
+ * Given a leaf node, finds its siblings by looking at the parent's children.
+ * 
+ * EXAMPLE: Parent has 3 children stored as:
+ * 
+ *   Parent Internal Node (num_keys = 2):
+ *   ┌────────────────────────────────────────────┐
+ *   │ child[0]=pg2, key[0]=10                   │
+ *   │ child[1]=pg3, key[1]=20                   │
+ *   │ right_child=pg4                           │
+ *   └────────────────────────────────────────────┘
+ *        ↓             ↓            ↓
+ *     [pg2]         [pg3]        [pg4]
+ *   (keys≤10)    (10<keys≤20)  (keys>20)
+ * 
+ * If searching for siblings of pg3:
+ *   - left_page = pg2  (child[i-1])
+ *   - right_page = pg4 (right_child, since i+1 == num_keys)
+ * 
+ * CRITICAL: When i+1 == num_keys, we must use right_child,
+ *           NOT child[i+1] which doesn't exist!
+ * 
+ * Returns: true if siblings found, false if node is root
+ */
 static bool find_leaf_siblings(
     Table *t,
     uint32_t leaf_page,
@@ -169,13 +288,14 @@ static bool find_leaf_siblings(
     uint32_t *parent_page
 ) {
     void *leaf = pager_get_page(t->pager, leaf_page);
-    if (is_node_root(leaf)) return false;
+    if (is_node_root(leaf)) return false;  // Root has no siblings
 
     *parent_page = *node_parent(leaf);
     void *parent = pager_get_page(t->pager, *parent_page);
 
     uint32_t num_keys = *internal_node_num_keys(parent);
 
+    /* Search through parent's children to find our position */
     for (uint32_t i = 0; i <= num_keys; i++) {
         uint32_t child =
             (i == num_keys)
@@ -183,11 +303,17 @@ static bool find_leaf_siblings(
                 : *internal_node_child(parent, i);
 
         if (child == leaf_page) {
+            /* Found ourselves! Now identify siblings */
+            
+            /* Left sibling: child[i-1] if i > 0, else none */
             *left_page  = (i > 0) ? *internal_node_child(parent, i - 1) : 0;
-            // Right sibling: if we're the rightmost child, there's no right sibling
+            
+            /* Right sibling: more complex due to right_child storage */
             if (i == num_keys) {
+                /* We're the rightmost child, no right sibling */
                 *right_page = 0;
             } else {
+                /* Right sibling is either child[i+1] or right_child */
                 *right_page = (i + 1 < num_keys) 
                     ? *internal_node_child(parent, i + 1)
                     : *internal_node_right_child(parent);
@@ -198,28 +324,55 @@ static bool find_leaf_siblings(
     return false;
 }
 
+/*
+ * try_borrow_from_left - Borrow a cell from left sibling if possible
+ * 
+ * When a leaf becomes underfull, try to borrow from its left sibling.
+ * Only borrow if left sibling has more than the minimum cells.
+ * 
+ * BEFORE:
+ *   ┌──────────────────┐     ┌───────────────┐
+ *   │ Left: [1,2,3,4,5]│ →   │ Curr: [10,11] │  (underfull!)
+ *   └──────────────────┘     └───────────────┘
+ *        (7 cells)               (2 cells)
+ * 
+ * AFTER borrowing last cell from left:
+ *   ┌──────────────────┐     ┌─────────────────┐
+ *   │ Left: [1,2,3,4]  │ →   │ Curr: [5,10,11] │  (now OK!)
+ *   └──────────────────┘     └─────────────────┘
+ *        (6 cells)               (3 cells)
+ * 
+ * STEPS:
+ * 1. Shift all cells in current node right to make space at index 0
+ * 2. Copy last cell from left sibling to current[0]
+ * 3. Update num_cells in both nodes
+ * 4. Update parent key for left sibling (its max key changed)
+ * 
+ * Returns: true if borrowed, false if left has too few cells
+ */
 static bool try_borrow_from_left(
     Table *t,
     uint32_t leaf_page,
     uint32_t left_page,
     uint32_t parent_page
 ) {
-    if (!left_page) return false;
+    if (!left_page) return false;  // No left sibling exists
 
     void *leaf = pager_get_page(t->pager, leaf_page);
     void *left = pager_get_page(t->pager, left_page);
 
+    /* Can only borrow if left has more than minimum */
     if (*leaf_node_num_cells(left) <= LEAF_NODE_MIN_CELLS)
         return false;
 
-    // shift leaf right
+    /* Shift current node's cells right to make room at position 0 */
     memmove(
         leaf_node_cell(leaf, 1),
         leaf_node_cell(leaf, 0),
         (*leaf_node_num_cells(leaf)) * LEAF_NODE_CELL_SIZE
     );
 
-    // copy last cell from left
+    /* Copy last cell from left sibling to current node's first position */
     uint32_t borrow_idx = *leaf_node_num_cells(left) - 1;
     memcpy(
         leaf_node_cell(leaf, 0),
@@ -227,49 +380,104 @@ static bool try_borrow_from_left(
         LEAF_NODE_CELL_SIZE
     );
 
+    /* Update cell counts */
     (*leaf_node_num_cells(left))--;
     (*leaf_node_num_cells(leaf))++;
 
+    /* Update parent's key for left sibling (its max key changed!) */
     internal_node_update_key_for_child(t, parent_page, left_page);
     return true;
 }
 
-
+/*
+ * try_borrow_from_right - Borrow a cell from right sibling if possible
+ * 
+ * Similar to borrowing from left, but takes first cell from right sibling
+ * and appends it to the end of current node.
+ * 
+ * BEFORE:
+ *   ┌───────────────┐     ┌────────────────────┐
+ *   │ Curr: [1,2]   │ →   │ Right: [10,11,12,13]│
+ *   └───────────────┘     └────────────────────┘
+ *      (2 cells)              (7 cells)
+ * 
+ * AFTER borrowing first cell from right:
+ *   ┌─────────────────┐     ┌────────────────┐
+ *   │ Curr: [1,2,10]  │ →   │ Right: [11,12,13]│
+ *   └─────────────────┘     └────────────────┘
+ *      (3 cells)              (6 cells)
+ * 
+ * STEPS:
+ * 1. Copy first cell from right sibling to end of current node
+ * 2. Shift all cells in right sibling left (removing first cell)
+ * 3. Update num_cells in both nodes
+ * 4. Update parent key for current node (its max key changed)
+ */
 static bool try_borrow_from_right(
     Table *t,
     uint32_t leaf_page,
     uint32_t right_page,
     uint32_t parent_page
 ) {
-    if (!right_page) return false;
+    if (!right_page) return false;  // No right sibling exists
 
     void *leaf = pager_get_page(t->pager, leaf_page);
     void *right = pager_get_page(t->pager, right_page);
 
+    /* Can only borrow if right has more than minimum */
     if (*leaf_node_num_cells(right) <= LEAF_NODE_MIN_CELLS)
         return false;
 
-    // copy first cell of right
+    /* Append first cell of right sibling to end of current node */
     memcpy(
         leaf_node_cell(leaf, *leaf_node_num_cells(leaf)),
         leaf_node_cell(right, 0),
         LEAF_NODE_CELL_SIZE
     );
 
-    // shift right left
+    /* Shift right sibling's cells left to remove first cell */
     memmove(
         leaf_node_cell(right, 0),
         leaf_node_cell(right, 1),
         (*leaf_node_num_cells(right) - 1) * LEAF_NODE_CELL_SIZE
     );
 
+    /* Update cell counts */
     (*leaf_node_num_cells(right))--;
     (*leaf_node_num_cells(leaf))++;
 
+    /* Update parent's key for current node (its max key changed!) */
     internal_node_update_key_for_child(t, parent_page, leaf_page);
     return true;
 }
 
+/*
+ * merge_leaf_nodes - Combine two underfull leaf nodes into one
+ * 
+ * When borrowing isn't possible, merge two siblings into one node.
+ * All cells from right node are copied to left node, then right is removed.
+ * 
+ * BEFORE:
+ *            Parent [key=5]
+ *              /        \
+ *   ┌──────────┐     ┌───────────┐
+ *   │ Left:[1,2]│ →   │Right:[6,7]│ →  (next leaf)
+ *   └──────────┘     └───────────┘
+ *     (2 cells)        (2 cells)
+ * 
+ * AFTER merging:
+ *          Parent (one child removed)
+ *              |
+ *   ┌────────────────┐
+ *   │ Left:[1,2,6,7] │ →  (next leaf)
+ *   └────────────────┘
+ *       (4 cells)
+ * 
+ * STEPS:
+ * 1. Copy all cells from right to end of left
+ * 2. Update left's next_leaf pointer to skip over right
+ * 3. Remove right node from parent (may trigger parent rebalancing)
+ */
 static void merge_leaf_nodes(
     Table *t,
     uint32_t left_page,
@@ -282,49 +490,98 @@ static void merge_leaf_nodes(
     uint32_t left_n = *leaf_node_num_cells(left);
     uint32_t right_n = *leaf_node_num_cells(right);
 
+    /* Copy all cells from right to end of left */
     memcpy(
         leaf_node_cell(left, left_n),
         leaf_node_cell(right, 0),
         right_n * LEAF_NODE_CELL_SIZE
     );
 
+    /* Update left's metadata */
     *leaf_node_num_cells(left) = left_n + right_n;
-    *leaf_node_next_leaf(left) = *leaf_node_next_leaf(right);
+    *leaf_node_next_leaf(left) = *leaf_node_next_leaf(right);  // Skip over right
 
-    // remove right_page from parent
+    /* Remove right node from parent (this may trigger parent rebalancing!) */
     internal_node_remove_child(t, parent_page, right_page);
 }
 
+/*
+ * maybe_shrink_root - Reduce tree height if root becomes empty
+ * 
+ * After deleting and merging nodes, the root internal node may end up with
+ * only one child (num_keys = 0). In this case, we promote the child to
+ * become the new root, reducing the tree height by 1.
+ * 
+ * BEFORE (3 levels):
+ *         Root Internal [num_keys=0]
+ *              |
+ *          (only child)
+ *              |
+ *         Internal Node
+ *           /    \
+ *        Leaf  Leaf
+ * 
+ * AFTER shrinking (2 levels):
+ *         Internal Node (new root!)
+ *           /    \
+ *        Leaf  Leaf
+ * 
+ * This is the opposite of split_root which increases height.
+ * 
+ * NOTE: This only applies to internal roots. A leaf root can have
+ *       as few as 1 cell and doesn't shrink.
+ */
 static void maybe_shrink_root(Table *t) {
     void *root = pager_get_page(t->pager, t->header.root_page_num);
 
+    /* Only shrink if root is internal and has no keys (only right_child) */
     if (get_node_type(root) == NODE_INTERNAL &&
         *internal_node_num_keys(root) == 0) {
 
-        uint32_t new_root =
-            *internal_node_right_child(root);
+        /* The only remaining child becomes the new root */
+        uint32_t new_root = *internal_node_right_child(root);
 
         void *child = pager_get_page(t->pager, new_root);
         set_node_root(child, true);
-        *node_parent(child) = 0;
+        *node_parent(child) = 0;  // Root has no parent
 
         t->header.root_page_num = new_root;
     }
 }
 
+/*
+ * rebalance_leaf - Orchestrate leaf rebalancing after deletion
+ * 
+ * This is the main entry point for leaf rebalancing. It tries multiple
+ * strategies in order of preference:
+ * 
+ * 1. Borrow from left sibling (if possible)
+ * 2. Borrow from right sibling (if possible)
+ * 3. Merge with left sibling
+ * 4. Merge with right sibling
+ * 5. Shrink root if it became empty
+ * 
+ * STRATEGY SELECTION:
+ * - Borrowing is preferred (keeps nodes more balanced)
+ * - Merging is last resort (may trigger cascading rebalancing)
+ * - Always try left before right (arbitrary choice)
+ */
 static void rebalance_leaf(Table *t, uint32_t leaf_page) {
     uint32_t left = 0, right = 0, parent = 0;
 
+    /* Find siblings. If root, no rebalancing needed */
     if (!find_leaf_siblings(t, leaf_page, &left, &right, &parent))
         return;
 
+    /* Try borrowing first (preferred) */
     if (try_borrow_from_left(t, leaf_page, left, parent)) return;
     if (try_borrow_from_right(t, leaf_page, right, parent)) return;
 
-    // merge
+    /* Borrowing failed, must merge */
     if (left) merge_leaf_nodes(t, left, leaf_page, parent);
     else if (right) merge_leaf_nodes(t, leaf_page, right, parent);
 
+    /* Check if tree height should be reduced */
     maybe_shrink_root(t);
 }
 
@@ -838,29 +1095,57 @@ static void internal_node_remove_child(Table *t, uint32_t parent_page, uint32_t 
 }
 
 /* ============================================================
- * Create new root when old root splits
- * - Old root contents moved into left child page
- * - Root page becomes internal node with 2 children
+ * TREE GROWTH: Split Root and Create New Level
  * ============================================================ */
 
+/*
+ * create_new_root - Increase tree height when root splits
+ * 
+ * When the root node splits (either leaf or internal), we need to create
+ * a new root internal node that points to both halves. This increases
+ * the tree height by 1.
+ * 
+ * BEFORE (root is full and about to split):
+ *         Root Leaf [1,2,3,4,5,6,7] (FULL - 7 cells)
+ * 
+ * AFTER split (tree height increased from 1 to 2):
+ *         New Root Internal [key=3]
+ *              /           \
+ *     Left [1,2,3]     Right [4,5,6,7]
+ *     (old root)        (new page)
+ * 
+ * STEPS:
+ * 1. Allocate new page for left child
+ * 2. Copy old root contents to left child
+ * 3. Transform root page into new internal node
+ * 4. Set parent pointers correctly
+ * 5. Build new root with 2 children (left and right)
+ * 
+ * NOTE: We reuse the root page number to avoid updating the DBHeader.
+ *       The old root content is moved to a new page (left child).
+ * 
+ * Parameters:
+ *   right_child_page: The newly created right half from the split
+ */
 static void create_new_root(Table *t, uint32_t right_child_page) {
     uint32_t root_page = t->header.root_page_num;
     void *root = pager_get_page(t->pager, root_page);
 
+    /* Allocate new page to hold old root's content (becomes left child) */
     uint32_t left_child_page = allocate_page(t);
     void *left_child = pager_get_page(t->pager, left_child_page);
 
-    // copy old root into left_child
+    /* Move old root content to left_child */
     memcpy(left_child, root, PAGE_SIZE);
-    set_node_root(left_child, false);
+    set_node_root(left_child, false);  // No longer root
     *node_parent(left_child) = root_page;
 
-    // root becomes new internal root
+    /* Transform root into internal node */
     initialize_internal_node(root);
     set_node_root(root, true);
-    *node_parent(root) = 0;
+    *node_parent(root) = 0;  // Root has no parent
 
-    // Build root from [left_child, right_child]
+    /* Build new root with 2 children */
     uint32_t children[2] = { left_child_page, right_child_page };
     sort_children_by_maxkey(t, children, 2);
     internal_node_rebuild(t, root_page, children, 2);
