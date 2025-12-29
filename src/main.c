@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <ctype.h>
 
 #define INPUT_BUFFER_SIZE 1024
 
@@ -41,8 +42,51 @@ static bool do_meta_command(const char *input) {
 
 /* ------ SQL Statements stub*/
 
-static void prepare_statement(const char *input) {
-    printf("SQL received (not executed yet): \"%s\"\n", input);
+typedef enum {
+    STATEMENT_INSERT,
+    STATEMENT_SELECT
+} StatementType;
+
+typedef struct {
+    StatementType type;
+} Statement;
+
+
+/* Case-insensitive prefix check */
+static bool starts_with_ignore_case(const char *str, const char *prefix) {
+    while (*prefix && *str) {
+        if (tolower((unsigned char)*str) != tolower((unsigned char)*prefix)) {
+            return false;
+        }
+        str++;
+        prefix++;
+    }
+    return *prefix == '\0';
+}
+
+static bool prepare_statement(const char *input, Statement *statement) {
+    if (starts_with_ignore_case(input, "insert")) {
+        statement->type = STATEMENT_INSERT;
+        return true;
+    }
+    if (starts_with_ignore_case(input, "select")) {
+        statement->type = STATEMENT_SELECT;
+        return true;
+    }
+
+    printf("Unrecognized SQL statement: '%s'\n", input);
+    return false;
+}
+
+static void execute_statement(const Statement *statement) {
+    switch (statement->type) {
+        case STATEMENT_INSERT:
+            puts("Insert not implemented yet");
+            break;
+        case STATEMENT_SELECT:
+            puts("Select not implemented yet");
+            break;
+    }
 }
 
 
@@ -69,7 +113,12 @@ int main(void) {
             continue;
         }
 
-        prepare_statement(input_buffer);
+        Statement statement;
+        if (!prepare_statement(input_buffer, &statement)) {
+            continue;
+        }
+
+        execute_statement(&statement);
     }
 
     puts("Bye!");
