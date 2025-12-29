@@ -501,6 +501,9 @@ static void merge_leaf_nodes(
     *leaf_node_num_cells(left) = left_n + right_n;
     *leaf_node_next_leaf(left) = *leaf_node_next_leaf(right);  // Skip over right
 
+    // Parent key update/fix
+    internal_node_update_key_for_child(t, parent_page, left_page);
+
     /* Remove right node from parent (this may trigger parent rebalancing!) */
     internal_node_remove_child(t, parent_page, right_page);
 }
@@ -1085,6 +1088,11 @@ static void internal_node_remove_child(Table *t, uint32_t parent_page, uint32_t 
         // Only one child left - this will be handled by maybe_shrink_root
         *internal_node_num_keys(parent) = 0;
         *internal_node_right_child(parent) = children[0];
+
+        // To avoid breaking recursive balance, future deletes, root shrinking, set child's 
+        // parent pointer
+        void *only = pager_get_page(t->pager, children[0]);
+        *node_parent(only) = parent_page;
     }
 
     // Check if parent became underfull and needs rebalancing
@@ -1392,7 +1400,11 @@ bool btree_delete(Table *t, int32_t key, char *errbuf, uint32_t errbuf_sz) {
      * If leaf becomes underfull, we DO NOTHING in Commit 11.
      * This is intentional groundwork for Commit 12 (merge/redistribute).
      */
-    uint32_t min_cells = is_node_root(leaf) ? 1 : LEAF_NODE_MIN_CELLS;
+    //uint32_t min_cells = is_node_root(leaf) ? 1 : LEAF_NODE_MIN_CELLS;
+    
+    // A root leaf is allowed to have 0 cells
+    uint32_t min_cells = is_node_root(leaf) ? 0 : LEAF_NODE_MIN_CELLS;
+    
 
     if (*leaf_node_num_cells(leaf) < min_cells) {
         rebalance_leaf(t, c->page_num);
