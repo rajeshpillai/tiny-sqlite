@@ -6,8 +6,30 @@
 
 #define INPUT_BUFFER_SIZE 1024
 
+#define COLUMN_USERNAME_SIZE 32
+#define COLUMN_EMAIL_SIZE 255
+#define TABLE_MAX_ROWS 1000
+
+
+
+// Row and Table structure
+typedef struct {
+    int id;
+    char username[COLUMN_USERNAME_SIZE + 1];
+    char email[COLUMN_EMAIL_SIZE + 1];
+} Row;
+
+typedef struct {
+    Row rows[TABLE_MAX_ROWS];
+    size_t num_rows;
+} Table;
+
+static Table table;
+
+// Input handling
+
 static void print_prompt(void) {
-    printf("minidb> ");
+    printf("tinydb> ");
 }
 
 static bool read_input(char *buffer, size_t buffer_size) {
@@ -49,6 +71,7 @@ typedef enum {
 
 typedef struct {
     StatementType type;
+    Row row_to_insert;
 } Statement;
 
 
@@ -64,10 +87,28 @@ static bool starts_with_ignore_case(const char *str, const char *prefix) {
     return *prefix == '\0';
 }
 
+/* INSERT syntax (simple version)*/
+static bool prepare_insert(const char *input, Statement *statement) {
+    statement->type = STATEMENT_INSERT;
+    int args_assigned = sscanf(
+        input,
+        "insert %d %32s %255s",
+        &statement->row_to_insert.id,
+        statement->row_to_insert.username,
+        statement->row_to_insert.email
+    );
+    
+    if (args_assigned < 3) {
+        puts("Syntax error. Usage: insert <id> <username> <email>");
+        return false;
+    }
+
+    return true;
+}
+
 static bool prepare_statement(const char *input, Statement *statement) {
     if (starts_with_ignore_case(input, "insert")) {
-        statement->type = STATEMENT_INSERT;
-        return true;
+        return prepare_insert(input, statement);
     }
     if (starts_with_ignore_case(input, "select")) {
         statement->type = STATEMENT_SELECT;
@@ -78,13 +119,36 @@ static bool prepare_statement(const char *input, Statement *statement) {
     return false;
 }
 
+/* execution stub*/
+
+static void execute_insert(const Statement *statement) {
+    if (table.num_rows >= TABLE_MAX_ROWS) {
+        puts("Error: Table is full");
+        return;
+    }
+    table.rows[table.num_rows] = statement->row_to_insert;
+    table.num_rows++;
+
+    puts("Executed.");
+}
+
+static void print_row(const Row *row) {
+    printf("(%d, %s, %s)\n", row->id, row->username, row->email);
+}
+
+static void execute_select(void) {
+    for (size_t i = 0; i < table.num_rows; i++) {
+        print_row(&table.rows[i]);
+    }
+}
+
 static void execute_statement(const Statement *statement) {
     switch (statement->type) {
         case STATEMENT_INSERT:
-            puts("Insert not implemented yet");
+            execute_insert(statement);
             break;
         case STATEMENT_SELECT:
-            puts("Select not implemented yet");
+            execute_select();
             break;
     }
 }
@@ -92,6 +156,8 @@ static void execute_statement(const Statement *statement) {
 
 int main(void) {
     char input_buffer[INPUT_BUFFER_SIZE];
+    table.num_rows = 0;
+
     puts("mindb (sqlite-like toy DB)");
     puts("Enter .help to show available commands.");
 

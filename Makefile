@@ -2,7 +2,7 @@ CC := gcc
 CLFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O0 -g 
 LDFLAGS :=
 
-BIN := minidb 
+BIN := tinydb 
 SRC := src/main.c 
 INC := -Iinclude 
 
