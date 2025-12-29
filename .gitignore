@@ -1,0 +1,35 @@
+# Build artifacts
+minidb
+*.o
+*.out
+*.exe
+
+# SQLite database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Core dumps
+core
+core.*
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+*.log
