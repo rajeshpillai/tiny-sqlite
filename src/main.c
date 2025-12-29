@@ -1,12 +1,10 @@
 // src/main.c
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <ctype.h>
 #include <stdint.h>
-#include <errno.h>
 
 #define INPUT_BUFFER_SIZE 1024
 
@@ -24,6 +22,14 @@ typedef struct {
     char email[COLUMN_EMAIL_SIZE + 1];
 } Row;
 
+/* ---------- DB Header (Page 0) ---------- */
+
+typedef struct {
+    uint32_t num_rows;
+    uint32_t root_page_num;    // future B-tree root
+    uint32_t next_free_page;   // page allocator cursor
+} DBHeader;
+
 /* ---------- Pager ---------- */
 
 typedef struct {
@@ -37,7 +43,7 @@ typedef struct {
 
 typedef struct {
     Pager *pager;
-    uint32_t num_rows;
+    DBHeader header;
 } Table;
 
 static Table *table;
@@ -49,91 +55,103 @@ static void fatal(const char *msg) {
     exit(EXIT_FAILURE);
 }
 
+static bool starts_with_icase_n(const char *str, const char *prefix, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (prefix[i] == '\0') return true;
+        if (str[i] == '\0') return false;
+        if (tolower((unsigned char)str[i]) != tolower((unsigned char)prefix[i]))
+            return false;
+    }
+    return true;
+}
+
+/* SAFE page offset calculation (prevents integer overflow) */
+static long page_offset(uint32_t page_num) {
+    return (long)page_num * (long)PAGE_SIZE;
+}
+
 /* ---------- Pager ---------- */
 
 static Pager *pager_open(const char *filename) {
     FILE *file = fopen(filename, "r+b");
-    if (!file) {
-        file = fopen(filename, "w+b");
-        if (!file) {
-            fatal("fopen");
-        }
-    }
+    if (!file) file = fopen(filename, "w+b");
+    if (!file) fatal("fopen");
 
-    fseek(file, 0L, SEEK_END);
-    uint32_t file_length = ftell(file);
+    fseek(file, 0, SEEK_END);
+    long fl = ftell(file);
+    if (fl < 0) fatal("ftell");
 
     Pager *pager = calloc(1, sizeof(Pager));
     pager->file = file;
-    pager->file_length = file_length;
-    pager->num_pages = file_length / PAGE_SIZE;
+    pager->file_length = (uint32_t)fl;
+    pager->num_pages = pager->file_length / PAGE_SIZE;
 
-    if (file_length % PAGE_SIZE != 0) {
-        fatal("DB file is not a whole number of pages");
+    if (pager->file_length % PAGE_SIZE != 0) {
+        fatal("Corrupt DB file");
     }
 
     return pager;
 }
 
 static void *get_page(Pager *pager, uint32_t page_num) {
-    if (page_num >= TABLE_MAX_PAGES) {
-        fatal("Page number out of bounds");
-    }
+    if (page_num >= TABLE_MAX_PAGES) fatal("Page out of bounds");
 
     if (pager->pages[page_num] == NULL) {
         void *page = calloc(1, PAGE_SIZE);
+        if (!page) fatal("calloc");
 
         if (page_num < pager->num_pages) {
-            fseek(pager->file, page_num * PAGE_SIZE, SEEK_SET);
-            fread(page, PAGE_SIZE, 1, pager->file);
+            fseek(pager->file, page_offset(page_num), SEEK_SET);
+            if (fread(page, PAGE_SIZE, 1, pager->file) != 1) {
+                fatal("fread");
+            }
         }
 
         pager->pages[page_num] = page;
 
-        if (page_num >= pager->num_pages) {
+        if (page_num >= pager->num_pages)
             pager->num_pages = page_num + 1;
-        }
     }
 
     return pager->pages[page_num];
 }
 
 static void pager_flush(Pager *pager, uint32_t page_num) {
-    if (pager->pages[page_num] == NULL) return;
+    if (!pager->pages[page_num]) return;
 
-    fseek(pager->file, page_num * PAGE_SIZE, SEEK_SET);
-    fwrite(pager->pages[page_num], PAGE_SIZE, 1, pager->file);
+    fseek(pager->file, page_offset(page_num), SEEK_SET);
+    if (fwrite(pager->pages[page_num], PAGE_SIZE, 1, pager->file) != 1) {
+        fatal("fwrite");
+    }
 }
 
 /* ---------- Table ---------- */
 
 static Table *db_open(const char *filename) {
     Pager *pager = pager_open(filename);
+    Table *t = calloc(1, sizeof(Table));
+    t->pager = pager;
 
-    Table *table = calloc(1, sizeof(Table));
-    table->pager = pager;
-    
-    // Read row count from metadata page (page 0)
     if (pager->num_pages > 0) {
-        void *header_page = get_page(pager, 0);
-        memcpy(&table->num_rows, header_page, sizeof(uint32_t));
+        void *page0 = get_page(pager, 0);
+        memcpy(&t->header, page0, sizeof(DBHeader));
     } else {
-        table->num_rows = 0;
+        t->header.num_rows = 0;
+        t->header.root_page_num = 0;
+        t->header.next_free_page = 1; // page 0 is header
     }
 
-    return table;
+    return t;
 }
 
-static void db_close(Table *table) {
-    Pager *pager = table->pager;
+static void db_close(Table *t) {
+    Pager *pager = t->pager;
 
-    // Write row count to metadata page (page 0)
-    void *header_page = get_page(pager, 0);
-    memcpy(header_page, &table->num_rows, sizeof(uint32_t));
+    void *page0 = get_page(pager, 0);
+    memcpy(page0, &t->header, sizeof(DBHeader));
 
-    // Flush and free only pages that were actually allocated
     for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-        if (pager->pages[i] != NULL) {
+        if (pager->pages[i]) {
             pager_flush(pager, i);
             free(pager->pages[i]);
         }
@@ -141,30 +159,29 @@ static void db_close(Table *table) {
 
     fclose(pager->file);
     free(pager);
-    free(table);
+    free(t);
 }
 
 /* ---------- Row Serialization ---------- */
 
-static void serialize_row(const Row *source, void *destination) {
-    memcpy(destination, source, sizeof(Row));
+static void serialize_row(const Row *src, void *dst) {
+    memcpy(dst, src, sizeof(Row));
 }
 
-static void deserialize_row(const void *source, Row *destination) {
-    memcpy(destination, source, sizeof(Row));
+static void deserialize_row(const void *src, Row *dst) {
+    memcpy(dst, src, sizeof(Row));
 }
 
-static void *row_slot(Table *table, uint32_t row_num) {
+static void *row_slot(Table *t, uint32_t row_num) {
     uint32_t row_offset = row_num * sizeof(Row);
     uint32_t page_num = row_offset / PAGE_SIZE;
     uint32_t byte_offset = row_offset % PAGE_SIZE;
 
-    // Page 0 is reserved for metadata, data starts at page 1
-    void *page = get_page(table->pager, page_num + 1);
+    void *page = get_page(t->pager, page_num + 1);
     return (char *)page + byte_offset;
 }
 
-/* ---------- REPL & SQL ---------- */
+/* ---------- SQL ---------- */
 
 typedef enum {
     STATEMENT_INSERT,
@@ -173,49 +190,21 @@ typedef enum {
 
 typedef struct {
     StatementType type;
-    Row row_to_insert;
+    Row row;
 } Statement;
 
-static void print_prompt(void) {
-    printf("minidb> ");
+static bool prepare_insert(const char *input, Statement *s) {
+    s->type = STATEMENT_INSERT;
+    return sscanf(input, "insert %d %32s %255s",
+                  &s->row.id, s->row.username, s->row.email) == 3;
 }
 
-static bool read_input(char *buffer, size_t size) {
-    if (!fgets(buffer, size, stdin)) return false;
-    buffer[strcspn(buffer, "\n")] = 0;
-    return true;
-}
+static bool prepare_statement(const char *input, Statement *s) {
+    if (starts_with_icase_n(input, "insert", 6))
+        return prepare_insert(input, s);
 
-static bool do_meta_command(const char *input) {
-    if (strcmp(input, ".exit") == 0) return false;
-    return true;
-}
-
-static bool prepare_insert(const char *input, Statement *statement) {
-    statement->type = STATEMENT_INSERT;
-
-    int args = sscanf(
-        input,
-        "insert %d %32s %255s",
-        &statement->row_to_insert.id,
-        statement->row_to_insert.username,
-        statement->row_to_insert.email
-    );
-
-    if (args < 3) {
-        puts("Syntax error");
-        return false;
-    }
-    return true;
-}
-
-static bool prepare_statement(const char *input, Statement *statement) {
-    if (strncasecmp(input, "insert", 6) == 0) {
-        return prepare_insert(input, statement);
-    }
-
-    if (strncasecmp(input, "select", 6) == 0) {
-        statement->type = STATEMENT_SELECT;
+    if (starts_with_icase_n(input, "select", 6)) {
+        s->type = STATEMENT_SELECT;
         return true;
     }
 
@@ -223,50 +212,36 @@ static bool prepare_statement(const char *input, Statement *statement) {
     return false;
 }
 
-static void execute_insert(const Statement *statement) {
-    serialize_row(
-        &statement->row_to_insert,
-        row_slot(table, table->num_rows)
-    );
-    table->num_rows++;
+static void execute_insert(const Statement *s) {
+    serialize_row(&s->row, row_slot(table, table->header.num_rows));
+    table->header.num_rows++;
     puts("Executed.");
 }
 
 static void execute_select(void) {
     Row row;
-    for (uint32_t i = 0; i < table->num_rows; i++) {
+    for (uint32_t i = 0; i < table->header.num_rows; i++) {
         deserialize_row(row_slot(table, i), &row);
         printf("(%d, %s, %s)\n", row.id, row.username, row.email);
     }
 }
 
-static void execute_statement(const Statement *statement) {
-    if (statement->type == STATEMENT_INSERT) {
-        execute_insert(statement);
-    } else {
-        execute_select();
-    }
-}
-
-/* ---------- Main ---------- */
-
 int main(void) {
     table = db_open("test.db");
-
     char input[INPUT_BUFFER_SIZE];
 
     while (true) {
-        print_prompt();
-        if (!read_input(input, sizeof(input))) break;
+        printf("minidb> ");
+        if (!fgets(input, sizeof(input), stdin)) break;
+        input[strcspn(input, "\n")] = 0;
 
-        if (input[0] == '.') {
-            if (!do_meta_command(input)) break;
-            continue;
-        }
+        if (strcmp(input, ".exit") == 0) break;
 
-        Statement statement;
-        if (!prepare_statement(input, &statement)) continue;
-        execute_statement(&statement);
+        Statement s;
+        if (!prepare_statement(input, &s)) continue;
+
+        if (s.type == STATEMENT_INSERT) execute_insert(&s);
+        else execute_select();
     }
 
     db_close(table);
